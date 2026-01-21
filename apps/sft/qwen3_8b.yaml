@@ -66,7 +66,7 @@ activation_checkpoint:
   selective_ac_option: op
 
 metric_logging:
-  wandb:
+  console:
     project: sft-training
     group: sft_exp_${oc.env:USER}
     logging_mode: global_reduce # global_reduce, per_rank_reduce, per_rank_no_reduce

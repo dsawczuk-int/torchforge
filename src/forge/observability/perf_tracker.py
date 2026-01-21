@@ -10,7 +10,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache, wraps
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 
@@ -118,6 +118,7 @@ class Tracer:
         # Memory tracking state
         self._memory_started = False
         self._start_mem = 0.0
+        self._memory_backend: _GPUBackend | None = None
 
     def start(self) -> None:
         if self._disable:
@@ -141,12 +142,12 @@ class Tracer:
             use_gpu = self.time_with_gpu
 
         if use_gpu:
-            if torch.cuda.is_available():
-                self._timer = _TimerCUDA()
-            elif torch.xpu.is_available():
-                self._timer = _TimerXPU()
-            else:
-                raise RuntimeError("GPU timing requested but no supported device is available")    
+            gpu_backend = _get_gpu_backend()
+            if gpu_backend is None:
+                raise RuntimeError(
+                    "GPU timing requested but no supported device is available"
+                )
+            self._timer = _TimerGPU(gpu_backend)
         else:
             self._timer = _TimerCPU()
 
@@ -185,49 +186,40 @@ class Tracer:
 
     def _start_memory_tracking(self) -> None:
         is_outer_scope = not _is_memory_active()
-        should_track = (
-            self.track_memory and is_outer_scope and (torch.cuda.is_available() or torch.xpu.is_available())
-        )
+        gpu_backend = _get_gpu_backend()
+        should_track = self.track_memory and is_outer_scope and gpu_backend is not None
 
         if self.track_memory and not is_outer_scope:
             _warn_nested_memory_tracking(self.prefix)
             return
 
-        if should_track:
+        if should_track and gpu_backend is not None:
             _set_memory_active(True)
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-                self._start_mem = torch.cuda.memory_allocated()
-            elif torch.xpu.is_available():
-                torch.xpu.reset_peak_memory_stats()
-                self._start_mem = torch.xpu.memory_allocated()
+            gpu_backend.reset_peak_memory_stats()
+            self._start_mem = gpu_backend.memory_allocated()
+            self._memory_backend = gpu_backend
             self._memory_started = True
 
     def _stop_memory_tracking(self) -> None:
         if not self._memory_started:
             return
 
-        if torch.cuda.is_available():
-            end_mem = torch.cuda.memory_allocated()
-        elif torch.xpu.is_available():
-            end_mem = torch.xpu.memory_allocated()
+        if self._memory_backend is None:
+            return
+
+        end_mem = self._memory_backend.memory_allocated()
 
         delta = (end_mem - self._start_mem) / 1024**3
 
-        if torch.cuda.is_available():
-            peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-        elif torch.xpu.is_available():
-            peak_mem = torch.xpu.max_memory_allocated() / 1024**3
+        peak_mem = self._memory_backend.max_memory_allocated() / 1024**3
 
         record_metric(
             f"{self.prefix}/memory_delta_end_start_avg_gb", delta, Reduce.MEAN
         )
         record_metric(f"{self.prefix}/memory_peak_max_gb", peak_mem, Reduce.MAX)
         _set_memory_active(False)
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        elif torch.xpu.is_available():
-            torch.xpu.reset_peak_memory_stats()
+        self._memory_backend.reset_peak_memory_stats()
+        self._memory_backend = None
         self._memory_started = False
 
     def _record_timing_metrics(
@@ -250,6 +242,50 @@ class _TimerProtocol(Protocol):
     def step(self, name: str) -> None: ...
 
     def get_all_durations(self) -> tuple[list[tuple[str, float]], float]: ...
+
+
+class _GPUBackend(Protocol):
+    """Protocol for GPU backends (CUDA/XPU) used in perf tracking."""
+
+    def current_stream(self) -> Any: ...
+
+    def Event(self, enable_timing: bool = True) -> Any: ...
+
+    def reset_peak_memory_stats(self) -> None: ...
+
+    def memory_allocated(self) -> int: ...
+
+    def max_memory_allocated(self) -> int: ...
+
+
+class _TorchGPUBackend:
+    """Wrapper exposing a uniform interface for torch.cuda/torch.xpu."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def current_stream(self) -> Any:
+        return self._module.current_stream()
+
+    def Event(self, enable_timing: bool = True) -> Any:
+        return self._module.Event(enable_timing=enable_timing)
+
+    def reset_peak_memory_stats(self) -> None:
+        self._module.reset_peak_memory_stats()
+
+    def memory_allocated(self) -> int:
+        return int(self._module.memory_allocated())
+
+    def max_memory_allocated(self) -> int:
+        return int(self._module.max_memory_allocated())
+
+
+def _get_gpu_backend() -> _GPUBackend | None:
+    """Return a GPU backend wrapper for CUDA/XPU if available, else None."""
+    if torch.cuda.is_available():
+        return _TorchGPUBackend(torch.cuda)
+    if torch.xpu.is_available():
+        return _TorchGPUBackend(torch.xpu)
 
 
 class _TimerCPU(_TimerProtocol):
@@ -284,12 +320,12 @@ class _TimerCPU(_TimerProtocol):
         return self._durations[:], stop_step_ms
 
 
-class _TimerCUDA(_TimerProtocol):
-    """CUDA timing backend with non-blocking events and futures.
-    Uses a thread pool to poll CUDA events asynchronously without blocking the main thread.
+class _TimerGPU(_TimerProtocol):
+    """GPU timing backend for CUDA or XPU with non-blocking events and futures.
+    Uses a thread pool to poll GPU events asynchronously without blocking the main thread.
 
     Example:
-        timer = _TimerCUDA()
+        timer = _TimerGPU(torch.cuda)
         timer.start()
         # torch.mm(a, b)  # ~100ms GPU
         timer.step("matmul")
@@ -297,28 +333,29 @@ class _TimerCUDA(_TimerProtocol):
         durs_steps, stop_step_ms = timer.get_all_durations()  # ([( "matmul", 100 )], 200)
     """
 
-    def __init__(self, max_workers: int = 2) -> None:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available for timing")
+    def __init__(self, gpu_backend: _GPUBackend, max_workers: int = 2) -> None:
+        if gpu_backend is None:
+            raise RuntimeError("GPU backend is required for timing")
+        self._gpu = gpu_backend
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: list[tuple[str, Future[float], int]] = (
             []
         )  # (name, future, submission_index)
         self._durations: list[tuple[str, float]] = []
-        self._chain_start: torch.cuda.Event | None = None
+        self._chain_start: Any | None = None
 
     def start(self) -> None:
         """Call before any steps. Clear state for reuse; record initial event on current stream."""
         self._futures.clear()
         self._durations.clear()
-        stream = torch.cuda.current_stream()
-        start_event = torch.cuda.Event(enable_timing=True)
+        stream = self._gpu.current_stream()
+        start_event = self._gpu.Event(enable_timing=True)
         start_event.record(stream)
         self._chain_start = start_event
 
     def step(self, name: str) -> None:
         """Mark the end of a GPU workload segment and start the next, submitting async polling.
-        Records a CUDA end event on the current stream; a background thread polls completion.
+        Records a GPU end event on the current stream; a background thread polls completion.
 
         Args:
             name: Label for this segment's duration
@@ -326,8 +363,8 @@ class _TimerCUDA(_TimerProtocol):
         if self._chain_start is None:
             raise ValueError("Timer must be started before calling step")
 
-        stream = torch.cuda.current_stream()
-        end_event = torch.cuda.Event(enable_timing=True)
+        stream = self._gpu.current_stream()
+        end_event = self._gpu.Event(enable_timing=True)
         end_event.record(stream)
 
         future = self._executor.submit(self._poll_elapsed, self._chain_start, end_event)
@@ -338,120 +375,8 @@ class _TimerCUDA(_TimerProtocol):
 
         self._chain_start = end_event
 
-    def _poll_elapsed(
-        self, start_event: torch.cuda.Event, end_event: torch.cuda.Event
-    ) -> float:
+    def _poll_elapsed(self, start_event: Any, end_event: Any) -> float:
         """Compute elapsed time after polling with backoff."""
-        # Poll until ready
-        sleep_time = 0.001  # Start at 1ms
-        while not end_event.query():
-            time.sleep(sleep_time)
-            sleep_time = min(sleep_time * 1.5, 0.05)  # Backoff, cap at 50ms
-        return start_event.elapsed_time(end_event)
-
-    def _collect_completed_futures(self, wait_till_done: bool = False) -> None:
-        """Drain done futures to avoid memory leak; update durations in submission order."""
-        still_pending = []
-        for name, future, idx in self._futures:
-            if future.done() or wait_till_done:
-                dur = future.result()
-                self._durations.append((name, dur))
-            else:
-                still_pending.append((name, future, idx))
-
-        self._futures = still_pending
-
-    def get_all_durations(self) -> tuple[list[tuple[str, float]], float]:
-        """Retrieve list of (step_name, duration) tuples and last step duration
-        between tracer.stop and the last step (or start if none). Order of tuples is random.
-        """
-        # Final timing since last step (or start) until this function is called
-        stop_step = f"_stop_step_{id(self)}"
-        self.step(stop_step)
-
-        # Wait on remaining futures
-        self._collect_completed_futures(wait_till_done=True)
-        self._futures.clear()
-
-        # Extract stop_step_ms
-        stop_step_ms = 0.0
-        durations = [
-            (name, duration) for name, duration in self._durations if name != stop_step
-        ]
-        for name, duration in self._durations:
-            if name == stop_step:
-                stop_step_ms = duration
-                break
-
-        return durations, stop_step_ms
-
-    def __del__(self) -> None:
-        # Fallback cleanup in finalizer
-        try:
-            self._executor.shutdown(wait=True)
-        except Exception:
-            return
-
-
-class _TimerXPU(_TimerProtocol):
-    """XPU timing backend with non-blocking events and futures.
-    Uses a thread pool to poll XPU events asynchronously without blocking the main thread.
-
-    Example:
-        timer = _TimerXPU()
-        timer.start()
-        # torch.mm(a, b)  # ~50ms GPU
-        timer.step("matmul")
-        # torch.mm(c, d)  # ~100ms
-        durs_steps, stop_step_ms = timer.get_all_durations()  # ([( "matmul", 50 )], 100)
-    """
-
-    def __init__(self, max_workers: int = 2) -> None:
-        if not torch.xpu.is_available():
-            raise RuntimeError("XPU is not available for timing")
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._futures: list[tuple[str, Future[float], int]] = (
-            []
-        )  # (name, future, submission_index)
-        self._durations: list[tuple[str, float]] = []
-        self._chain_start: "torch.xpu.Event | None" = None
-
-    def start(self) -> None:
-        """Call before any steps. Clear state for reuse; record initial event on current stream."""
-        self._futures.clear()
-        self._durations.clear()
-        stream = torch.xpu.current_stream()
-        start_event = torch.xpu.Event(enable_timing=True)
-        start_event.record(stream)
-        self._chain_start = start_event
-
-    def step(self, name: str) -> None:
-        """Mark the end of an GPU workload segment and start the next, submitting async polling.
-        Records an GPU end event on the current stream; a background thread polls completion.
-
-        Args:
-            name: Label for this segment's duration
-        """
-        if self._chain_start is None:
-            raise ValueError("Timer must be started before calling step")
-
-        stream = torch.xpu.current_stream()
-        end_event = torch.xpu.Event(enable_timing=True)
-        end_event.record(stream)
-
-        future = self._executor.submit(self._poll_elapsed, self._chain_start, end_event)
-        index = len(self._futures)
-        self._futures.append((name, future, index))
-        if len(self._futures) >= 5:  # clean up every 5
-            self._collect_completed_futures()
-
-        self._chain_start = end_event
-
-    def _poll_elapsed(
-        self, start_event: torch.xpu.Event, end_event: torch.xpu.Event
-    ) -> float:
-        """Compute elapsed time after polling with backoff."""
-        # Poll until ready
         sleep_time = 0.001  # Start at 1ms
         while not end_event.query():
             time.sleep(sleep_time)
