@@ -237,7 +237,7 @@ class Tracer:
             _warn_nested_memory_tracking(self.prefix)
             return
 
-        if should_track and self._gpu_backend is not None:
+        if should_track:
             _set_memory_active(True)
             self._gpu_backend.reset_peak_memory_stats()
             self._start_mem = self._gpu_backend.memory_allocated()
@@ -257,8 +257,7 @@ class Tracer:
         )
         record_metric(f"{self.prefix}/memory_peak_max_gb", peak_mem, Reduce.MAX)
         _set_memory_active(False)
-        self._memory_backend.reset_peak_memory_stats()
-        self._memory_backend = None
+        self._gpu_backend.reset_peak_memory_stats()
         self._memory_started = False
 
     def _record_timing_metrics(
@@ -328,7 +327,7 @@ class _TimerGPU(_TimerProtocol):
         durs_steps, stop_step_ms = timer.get_all_durations()  # ([( "matmul", 100 )], 200)
     """
 
-    def __init__(self, gpu_backend: _GPUBackend, max_workers: int = 2) -> None:
+    def __init__(self, gpu_backend: _GPUBackendProtocol, max_workers: int = 2) -> None:
         if gpu_backend is None:
             raise RuntimeError("GPU backend is required for timing")
         self._gpu = gpu_backend
