@@ -11,7 +11,6 @@ from typing import Literal, Union
 from unittest.mock import Mock, patch
 
 import pytest
-import torch
 from forge.env import DISABLE_PERF_METRICS, METRIC_TIMER_USES_GPU
 from forge.observability.metrics import Reduce
 

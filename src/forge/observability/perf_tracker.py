@@ -53,12 +53,12 @@ class _Event(Protocol):
     def elapsed_time(self, end_event: "_Event") -> float: ...
 
 
-class _GPUBackendProtocol(Protocol):
+class _DeviceProtocol(Protocol):
     """Protocol for GPU backends."""
 
     def current_stream(self) -> Any: ...
 
-    def Event(self, enable_timing: bool = True) -> _Event: ...
+    def record_event(self) -> _Event: ...
 
     def reset_peak_memory_stats(self) -> None: ...
 
@@ -79,23 +79,22 @@ class _GPUEvent(_Event):
     def query(self) -> bool:
         return bool(self._event.query())
 
-    def elapsed_time(self, end_event: "_Event") -> float:
+    def elapsed_time(self, end_event: _Event) -> float:
         if isinstance(end_event, _GPUEvent):
             return float(self._event.elapsed_time(end_event._event))
         return float(self._event.elapsed_time(end_event))  # type: ignore[arg-type]
 
 
-class _TorchGPUBackend(_GPUBackendProtocol):
+class _TorchGPUBackend(_DeviceProtocol):
     """Wrapper exposing a uniform interface for torch.cuda/torch.xpu."""
 
     def __init__(self, module: Any) -> None:
         self._module = module
 
-    def current_stream(self) -> Any:
-        return self._module.current_stream()
-
-    def Event(self, enable_timing: bool = True) -> _Event:
-        return _GPUEvent(self._module.Event(enable_timing=enable_timing))
+    def record_event(self) -> _GPUEvent:
+        event = _GPUEvent(self._module.Event(enable_timing=True))
+        event.record(self._module.current_stream())
+        return event
 
     def reset_peak_memory_stats(self) -> None:
         self._module.reset_peak_memory_stats()
@@ -107,7 +106,7 @@ class _TorchGPUBackend(_GPUBackendProtocol):
         return int(self._module.max_memory_allocated())
 
 
-def _get_gpu_backend() -> _GPUBackendProtocol | None:
+def _get_device_backend() -> _DeviceProtocol | None:
     """Return a GPU backend wrapper for CUDA/XPU if available, else None."""
     if torch.cuda.is_available():
         return _TorchGPUBackend(torch.cuda)
@@ -185,7 +184,7 @@ class Tracer:
         )
         self._active = False
 
-        self._gpu_backend: _GPUBackendProtocol | None = _get_gpu_backend()
+        self._device_backend: _DeviceProtocol | None = _get_device_backend()
 
         # Timing state
         self._timer: _TimerProtocol | None = None
@@ -216,11 +215,11 @@ class Tracer:
             use_gpu = self.time_with_gpu
 
         if use_gpu:
-            if self._gpu_backend is None:
+            if self._device_backend is None:
                 raise RuntimeError(
                     "GPU timing requested but no supported device is available"
                 )
-            self._timer = _TimerGPU(self._gpu_backend)
+            self._timer = _TimerGPU(self._device_backend)
         else:
             self._timer = _TimerCPU()
 
@@ -259,7 +258,9 @@ class Tracer:
 
     def _start_memory_tracking(self) -> None:
         is_outer_scope = not _is_memory_active()
-        should_track = self.track_memory and is_outer_scope and self._gpu_backend is not None
+        should_track = (
+            self.track_memory and is_outer_scope and self._device_backend is not None
+        )
 
         if self.track_memory and not is_outer_scope:
             _warn_nested_memory_tracking(self.prefix)
@@ -267,25 +268,25 @@ class Tracer:
 
         if should_track:
             _set_memory_active(True)
-            self._gpu_backend.reset_peak_memory_stats()
-            self._start_mem = self._gpu_backend.memory_allocated()
+            self._device_backend.reset_peak_memory_stats()
+            self._start_mem = self._device_backend.memory_allocated()
             self._memory_started = True
 
     def _stop_memory_tracking(self) -> None:
         if not self._memory_started:
             return
 
-        end_mem = self._gpu_backend.memory_allocated()
+        end_mem = self._device_backend.memory_allocated()
 
         delta = (end_mem - self._start_mem) / 1024**3
 
-        peak_mem = self._gpu_backend.max_memory_allocated() / 1024**3
+        peak_mem = self._device_backend.max_memory_allocated() / 1024**3
         record_metric(
             f"{self.prefix}/memory_delta_end_start_avg_gb", delta, Reduce.MEAN
         )
         record_metric(f"{self.prefix}/memory_peak_max_gb", peak_mem, Reduce.MAX)
         _set_memory_active(False)
-        self._gpu_backend.reset_peak_memory_stats()
+        self._device_backend.reset_peak_memory_stats()
         self._memory_started = False
 
     def _record_timing_metrics(
@@ -355,10 +356,12 @@ class _TimerGPU(_TimerProtocol):
         durs_steps, stop_step_ms = timer.get_all_durations()  # ([( "matmul", 100 )], 200)
     """
 
-    def __init__(self, gpu_backend: _GPUBackendProtocol, max_workers: int = 2) -> None:
-        if gpu_backend is None:
+    def __init__(
+        self, device_backend: _DeviceProtocol, max_workers: int = 2
+    ) -> None:
+        if device_backend is None:
             raise RuntimeError("GPU backend is required for timing")
-        self._gpu = gpu_backend
+        self._device = device_backend
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: list[tuple[str, Future[float], int]] = (
             []
@@ -370,10 +373,7 @@ class _TimerGPU(_TimerProtocol):
         """Call before any steps. Clear state for reuse; record initial event on current stream."""
         self._futures.clear()
         self._durations.clear()
-        stream = self._gpu.current_stream()
-        start_event = self._gpu.Event(enable_timing=True)
-        start_event.record(stream)
-        self._chain_start = start_event
+        self._chain_start = self._device.record_event()
 
     def step(self, name: str) -> None:
         """Mark the end of a GPU workload segment and start the next, submitting async polling.
@@ -385,9 +385,7 @@ class _TimerGPU(_TimerProtocol):
         if self._chain_start is None:
             raise ValueError("Timer must be started before calling step")
 
-        stream = self._gpu.current_stream()
-        end_event = self._gpu.Event(enable_timing=True)
-        end_event.record(stream)
+        end_event = self._device.record_event()
 
         future = self._executor.submit(self._poll_elapsed, self._chain_start, end_event)
         index = len(self._futures)
