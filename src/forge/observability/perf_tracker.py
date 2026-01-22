@@ -43,18 +43,46 @@ def _warn_nested_memory_tracking(prefix: str) -> None:
     )
 
 
+class _Event(Protocol):
+    """Protocol for GPU event objects."""
+
+    def record(self, stream: Any) -> None: ...
+
+    def query(self) -> bool: ...
+
+    def elapsed_time(self, end_event: "_Event") -> float: ...
+
+
 class _GPUBackendProtocol(Protocol):
     """Protocol for GPU backends."""
 
     def current_stream(self) -> Any: ...
 
-    def Event(self, enable_timing: bool = True) -> Any: ...
+    def Event(self, enable_timing: bool = True) -> _Event: ...
 
     def reset_peak_memory_stats(self) -> None: ...
 
     def memory_allocated(self) -> int: ...
 
     def max_memory_allocated(self) -> int: ...
+
+
+class _GPUEvent(_Event):
+    """Wrapper for torch event objects (CUDA/XPU)."""
+
+    def __init__(self, event: Any) -> None:
+        self._event = event
+
+    def record(self, stream: Any) -> None:
+        self._event.record(stream)
+
+    def query(self) -> bool:
+        return bool(self._event.query())
+
+    def elapsed_time(self, end_event: "_Event") -> float:
+        if isinstance(end_event, _GPUEvent):
+            return float(self._event.elapsed_time(end_event._event))
+        return float(self._event.elapsed_time(end_event))  # type: ignore[arg-type]
 
 
 class _TorchGPUBackend(_GPUBackendProtocol):
@@ -66,8 +94,8 @@ class _TorchGPUBackend(_GPUBackendProtocol):
     def current_stream(self) -> Any:
         return self._module.current_stream()
 
-    def Event(self, enable_timing: bool = True) -> Any:
-        return self._module.Event(enable_timing=enable_timing)
+    def Event(self, enable_timing: bool = True) -> _Event:
+        return _GPUEvent(self._module.Event(enable_timing=enable_timing))
 
     def reset_peak_memory_stats(self) -> None:
         self._module.reset_peak_memory_stats()
@@ -336,7 +364,7 @@ class _TimerGPU(_TimerProtocol):
             []
         )  # (name, future, submission_index)
         self._durations: list[tuple[str, float]] = []
-        self._chain_start: Any | None = None
+        self._chain_start: _Event | None = None
 
     def start(self) -> None:
         """Call before any steps. Clear state for reuse; record initial event on current stream."""
@@ -369,8 +397,11 @@ class _TimerGPU(_TimerProtocol):
 
         self._chain_start = end_event
 
-    def _poll_elapsed(self, start_event: Any, end_event: Any) -> float:
+    def _poll_elapsed(
+        self, start_event: _Event, end_event: _Event
+    ) -> float:
         """Compute elapsed time after polling with backoff."""
+        # Poll until ready
         sleep_time = 0.001  # Start at 1ms
         while not end_event.query():
             time.sleep(sleep_time)
@@ -393,12 +424,15 @@ class _TimerGPU(_TimerProtocol):
         """Retrieve list of (step_name, duration) tuples and last step duration
         between tracer.stop and the last step (or start if none). Order of tuples is random.
         """
+        # Final timing since last step (or start) until this function is called
         stop_step = f"_stop_step_{id(self)}"
         self.step(stop_step)
 
+        # Wait on remaining futures
         self._collect_completed_futures(wait_till_done=True)
         self._futures.clear()
 
+        # Extract stop_step_ms
         stop_step_ms = 0.0
         durations = [
             (name, duration) for name, duration in self._durations if name != stop_step
@@ -411,6 +445,7 @@ class _TimerGPU(_TimerProtocol):
         return durations, stop_step_ms
 
     def __del__(self) -> None:
+        # Fallback cleanup in finalizer
         try:
             self._executor.shutdown(wait=True)
         except Exception:
