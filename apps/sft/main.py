@@ -296,15 +296,6 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
         self.optimizers.step()
         self.lr_schedulers.step()
 
-    def _truncate_batch_to_seq_len(self, batch: dict, seq_len: int) -> dict:
-        if seq_len is None or seq_len <= 0:
-            return batch
-        for key in ("tokens", "labels", "mask"):
-            value = batch.get(key)
-            if isinstance(value, torch.Tensor) and value.ndim >= 2:
-                batch[key] = value[:, :seq_len]
-        return batch
-
     async def evaluate(self) -> None:
         """Run evaluation on multiple datasets, one at a time.
 
