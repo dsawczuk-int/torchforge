@@ -55,7 +55,7 @@ class _DeviceProtocol(Protocol):
     def current_stream(self) -> Any: ...
 
     def record_event(self) -> _EventProtocol: ...
-    
+
     def reset_peak_memory_stats(self) -> None: ...
 
     def memory_allocated(self) -> int: ...
@@ -66,19 +66,17 @@ class _DeviceProtocol(Protocol):
 class _EventGPU(_EventProtocol):
     """Wrapper for torch event objects (CUDA/XPU)."""
 
-    def __init__(self, event: Any) -> None:
+    def __init__(self, event: torch.cuda.Event | torch.xpu.Event) -> None:
         self._event = event
 
-    def record(self, stream: Any) -> None:
+    def record(self, stream: torch.cuda.Stream | torch.xpu.Stream) -> None:
         self._event.record(stream)
 
     def query(self) -> bool:
         return bool(self._event.query())
 
-    def elapsed_time(self, end_event: _EventProtocol) -> float:
-        if isinstance(end_event, _EventGPU):
-            return float(self._event.elapsed_time(end_event._event))
-        return float(self._event.elapsed_time(end_event))
+    def elapsed_time(self, end_event: '_EventGPU') -> float:
+        return float(self._event.elapsed_time(end_event._event))
 
 
 class _DeviceCUDA(_DeviceProtocol):
@@ -374,7 +372,7 @@ class _TimerGPU(_TimerProtocol):
             []
         )  # (name, future, submission_index)
         self._durations: list[tuple[str, float]] = []
-        self._chain_start: _Event | None = None
+        self._chain_start: _EventProtocol | None = None
 
     def start(self) -> None:
         """Call before any steps. Clear state for reuse; record initial event on current stream."""
