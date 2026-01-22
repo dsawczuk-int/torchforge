@@ -353,7 +353,7 @@ class _TimerGPU(_TimerProtocol):
     Uses a thread pool to poll GPU events asynchronously without blocking the main thread.
 
     Example:
-        timer = _TimerGPU(torch.cuda)
+        timer = _TimerGPU(_get_device())  # GPU backend required
         timer.start()
         # torch.mm(a, b)  # ~100ms GPU
         timer.step("matmul")
