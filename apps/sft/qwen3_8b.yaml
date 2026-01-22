@@ -27,21 +27,21 @@ lr_scheduler:
 
 training:
   local_batch_size: 1
-  seq_len: 2
+  seq_len: 2048
   max_norm: 1.0
   steps: 10
   dtype: bfloat16
   compile: false
   datasets:
     - path: "yahma/alpaca-cleaned"
-      split: "train[:5%]"
+      split: "train[:95%]"
 
 eval:
   eval_every_n_steps: 5  # null = disabled
   max_eval_steps: 5    # null = run until epoch completes
   datasets:
       - path: "yahma/alpaca-cleaned"
-        split: "train[99%:]"
+        split: "train[95%:]"
 
 parallelism:
   data_parallel_replicate_degree: 1
