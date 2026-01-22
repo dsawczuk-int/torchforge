@@ -21,7 +21,7 @@ from typing import Any
 import torch
 
 import torchtitan.experiments.forge.train_spec as forge_train_spec
-from forge.controller import ForgeActor
+from forge.controller import ForgeActor, shutdown
 from forge.data.collate import collate_padded
 from forge.data.datasets.sft_dataset import AlpacaToMessages, sft_iterable_dataset
 from forge.data.tokenizer import HuggingFaceModelTokenizer
@@ -433,7 +433,7 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
             # Move tensors to the appropriate device
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to("cuda")  # TODO: hardcoded for now
+                    batch[k] = v.to(self.device)
 
             self.train_step(batch)
             # self.profiler.step()
@@ -492,7 +492,7 @@ async def run(cfg: DictConfig) -> None:
     logging.info("Done training. Clean up")
     await recipe.cleanup.call()
 
-    await recipe.mesh.stop()
+    await shutdown()
     logging.info("All done!")
 
 
