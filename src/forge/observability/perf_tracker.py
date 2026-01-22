@@ -195,7 +195,7 @@ class Tracer:
         )
         self._active = False
 
-        self._device_backend: _DeviceProtocol | None = _get_device()
+        self._device: _DeviceProtocol | None = _get_device()
 
         # Timing state
         self._timer: _TimerProtocol | None = None
@@ -226,11 +226,11 @@ class Tracer:
             use_gpu = self.time_with_gpu
 
         if use_gpu:
-            if self._device_backend is None:
+            if self._device is None:
                 raise RuntimeError(
                     "GPU timing requested but no supported device is available"
                 )
-            self._timer = _TimerGPU(self._device_backend)
+            self._timer = _TimerGPU(self._device)
         else:
             self._timer = _TimerCPU()
 
@@ -270,7 +270,7 @@ class Tracer:
     def _start_memory_tracking(self) -> None:
         is_outer_scope = not _is_memory_active()
         should_track = (
-            self.track_memory and is_outer_scope and self._device_backend is not None
+            self.track_memory and is_outer_scope and self._device is not None
         )
 
         if self.track_memory and not is_outer_scope:
@@ -279,25 +279,25 @@ class Tracer:
 
         if should_track:
             _set_memory_active(True)
-            self._device_backend.reset_peak_memory_stats()
-            self._start_mem = self._device_backend.memory_allocated()
+            self._device.reset_peak_memory_stats()
+            self._start_mem = self._device.memory_allocated()
             self._memory_started = True
 
     def _stop_memory_tracking(self) -> None:
         if not self._memory_started:
             return
 
-        end_mem = self._device_backend.memory_allocated()
+        end_mem = self._device.memory_allocated()
 
         delta = (end_mem - self._start_mem) / 1024**3
 
-        peak_mem = self._device_backend.max_memory_allocated() / 1024**3
+        peak_mem = self._device.max_memory_allocated() / 1024**3
         record_metric(
             f"{self.prefix}/memory_delta_end_start_avg_gb", delta, Reduce.MEAN
         )
         record_metric(f"{self.prefix}/memory_peak_max_gb", peak_mem, Reduce.MAX)
         _set_memory_active(False)
-        self._device_backend.reset_peak_memory_stats()
+        self._device.reset_peak_memory_stats()
         self._memory_started = False
 
     def _record_timing_metrics(
