@@ -43,23 +43,19 @@ def _warn_nested_memory_tracking(prefix: str) -> None:
     )
 
 
-class _Event(Protocol):
-    """Protocol for GPU event objects."""
-
+class _EventProtocol(Protocol):
     def record(self, stream: Any) -> None: ...
 
     def query(self) -> bool: ...
 
-    def elapsed_time(self, end_event: "_Event") -> float: ...
+    def elapsed_time(self, end_event: '_EventProtocol') -> float: ...
 
 
 class _DeviceProtocol(Protocol):
-    """Protocol for GPU backends."""
-
     def current_stream(self) -> Any: ...
 
-    def record_event(self) -> _Event: ...
-
+    def record_event(self) -> _EventProtocol: ...
+    
     def reset_peak_memory_stats(self) -> None: ...
 
     def memory_allocated(self) -> int: ...
@@ -67,7 +63,7 @@ class _DeviceProtocol(Protocol):
     def max_memory_allocated(self) -> int: ...
 
 
-class _GPUEvent(_Event):
+class _EventGPU(_EventProtocol):
     """Wrapper for torch event objects (CUDA/XPU)."""
 
     def __init__(self, event: Any) -> None:
@@ -79,15 +75,15 @@ class _GPUEvent(_Event):
     def query(self) -> bool:
         return bool(self._event.query())
 
-    def elapsed_time(self, end_event: _Event) -> float:
-        if isinstance(end_event, _GPUEvent):
+    def elapsed_time(self, end_event: _EventProtocol) -> float:
+        if isinstance(end_event, _EventGPU):
             return float(self._event.elapsed_time(end_event._event))
         return float(self._event.elapsed_time(end_event))
 
 
 class _DeviceCUDA(_DeviceProtocol):
-    def record_event(self) -> _GPUEvent:
-        event = _GPUEvent(torch.cuda.Event(enable_timing=True))
+    def record_event(self) -> _EventProtocol:
+        event = _EventGPU(torch.cuda.Event(enable_timing=True))
         event.record(torch.cuda.current_stream())
         return event
 
@@ -102,8 +98,8 @@ class _DeviceCUDA(_DeviceProtocol):
 
 
 class _DeviceXPU(_DeviceProtocol):
-    def record_event(self) -> _GPUEvent:
-        event = _GPUEvent(torch.xpu.Event(enable_timing=True))
+    def record_event(self) -> _EventProtocol:
+        event = _EventGPU(torch.xpu.Event(enable_timing=True))
         event.record(torch.xpu.current_stream())
         return event
 
@@ -407,7 +403,7 @@ class _TimerGPU(_TimerProtocol):
         self._chain_start = end_event
 
     def _poll_elapsed(
-        self, start_event: _Event, end_event: _Event
+        self, start_event: _EventProtocol, end_event: _EventProtocol
     ) -> float:
         """Compute elapsed time after polling with backoff."""
         # Poll until ready
