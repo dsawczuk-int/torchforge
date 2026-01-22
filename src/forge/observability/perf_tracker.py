@@ -43,6 +43,51 @@ def _warn_nested_memory_tracking(prefix: str) -> None:
     )
 
 
+class _GPUBackendProtocol(Protocol):
+    """Protocol for GPU backends."""
+
+    def current_stream(self) -> Any: ...
+
+    def Event(self, enable_timing: bool = True) -> Any: ...
+
+    def reset_peak_memory_stats(self) -> None: ...
+
+    def memory_allocated(self) -> int: ...
+
+    def max_memory_allocated(self) -> int: ...
+
+
+class _TorchGPUBackend(_GPUBackendProtocol):
+    """Wrapper exposing a uniform interface for torch.cuda/torch.xpu."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def current_stream(self) -> Any:
+        return self._module.current_stream()
+
+    def Event(self, enable_timing: bool = True) -> Any:
+        return self._module.Event(enable_timing=enable_timing)
+
+    def reset_peak_memory_stats(self) -> None:
+        self._module.reset_peak_memory_stats()
+
+    def memory_allocated(self) -> int:
+        return int(self._module.memory_allocated())
+
+    def max_memory_allocated(self) -> int:
+        return int(self._module.max_memory_allocated())
+
+
+def _get_gpu_backend() -> _GPUBackendProtocol | None:
+    """Return a GPU backend wrapper for CUDA/XPU if available, else None."""
+    if torch.cuda.is_available():
+        return _TorchGPUBackend(torch.cuda)
+    if torch.xpu.is_available():
+        return _TorchGPUBackend(torch.xpu)
+    return None
+
+
 """
 
 class Tracer:
@@ -112,13 +157,14 @@ class Tracer:
         )
         self._active = False
 
+        self._gpu_backend: _GPUBackendProtocol | None = _get_gpu_backend()
+
         # Timing state
         self._timer: _TimerProtocol | None = None
 
         # Memory tracking state
         self._memory_started = False
         self._start_mem = 0.0
-        self._memory_backend: _GPUBackend | None = None
 
     def start(self) -> None:
         if self._disable:
@@ -142,12 +188,11 @@ class Tracer:
             use_gpu = self.time_with_gpu
 
         if use_gpu:
-            gpu_backend = _get_gpu_backend()
-            if gpu_backend is None:
+            if self._gpu_backend is None:
                 raise RuntimeError(
                     "GPU timing requested but no supported device is available"
                 )
-            self._timer = _TimerGPU(gpu_backend)
+            self._timer = _TimerGPU(self._gpu_backend)
         else:
             self._timer = _TimerCPU()
 
@@ -186,33 +231,27 @@ class Tracer:
 
     def _start_memory_tracking(self) -> None:
         is_outer_scope = not _is_memory_active()
-        gpu_backend = _get_gpu_backend()
-        should_track = self.track_memory and is_outer_scope and gpu_backend is not None
+        should_track = self.track_memory and is_outer_scope and self._gpu_backend is not None
 
         if self.track_memory and not is_outer_scope:
             _warn_nested_memory_tracking(self.prefix)
             return
 
-        if should_track and gpu_backend is not None:
+        if should_track and self._gpu_backend is not None:
             _set_memory_active(True)
-            gpu_backend.reset_peak_memory_stats()
-            self._start_mem = gpu_backend.memory_allocated()
-            self._memory_backend = gpu_backend
+            self._gpu_backend.reset_peak_memory_stats()
+            self._start_mem = self._gpu_backend.memory_allocated()
             self._memory_started = True
 
     def _stop_memory_tracking(self) -> None:
         if not self._memory_started:
             return
 
-        if self._memory_backend is None:
-            return
-
-        end_mem = self._memory_backend.memory_allocated()
+        end_mem = self._gpu_backend.memory_allocated()
 
         delta = (end_mem - self._start_mem) / 1024**3
 
-        peak_mem = self._memory_backend.max_memory_allocated() / 1024**3
-
+        peak_mem = self._gpu_backend.max_memory_allocated() / 1024**3
         record_metric(
             f"{self.prefix}/memory_delta_end_start_avg_gb", delta, Reduce.MEAN
         )
@@ -242,50 +281,6 @@ class _TimerProtocol(Protocol):
     def step(self, name: str) -> None: ...
 
     def get_all_durations(self) -> tuple[list[tuple[str, float]], float]: ...
-
-
-class _GPUBackend(Protocol):
-    """Protocol for GPU backends (CUDA/XPU) used in perf tracking."""
-
-    def current_stream(self) -> Any: ...
-
-    def Event(self, enable_timing: bool = True) -> Any: ...
-
-    def reset_peak_memory_stats(self) -> None: ...
-
-    def memory_allocated(self) -> int: ...
-
-    def max_memory_allocated(self) -> int: ...
-
-
-class _TorchGPUBackend:
-    """Wrapper exposing a uniform interface for torch.cuda/torch.xpu."""
-
-    def __init__(self, module: Any) -> None:
-        self._module = module
-
-    def current_stream(self) -> Any:
-        return self._module.current_stream()
-
-    def Event(self, enable_timing: bool = True) -> Any:
-        return self._module.Event(enable_timing=enable_timing)
-
-    def reset_peak_memory_stats(self) -> None:
-        self._module.reset_peak_memory_stats()
-
-    def memory_allocated(self) -> int:
-        return int(self._module.memory_allocated())
-
-    def max_memory_allocated(self) -> int:
-        return int(self._module.max_memory_allocated())
-
-
-def _get_gpu_backend() -> _GPUBackend | None:
-    """Return a GPU backend wrapper for CUDA/XPU if available, else None."""
-    if torch.cuda.is_available():
-        return _TorchGPUBackend(torch.cuda)
-    if torch.xpu.is_available():
-        return _TorchGPUBackend(torch.xpu)
 
 
 class _TimerCPU(_TimerProtocol):
