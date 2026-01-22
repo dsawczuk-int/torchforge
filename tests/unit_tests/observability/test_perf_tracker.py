@@ -11,16 +11,11 @@ from typing import Literal, Union
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 from forge.env import DISABLE_PERF_METRICS, METRIC_TIMER_USES_GPU
 from forge.observability.metrics import Reduce
 
-from forge.observability.perf_tracker import (
-    _get_device,
-    _TimerCPU,
-    _TimerGPU,
-    trace,
-    Tracer,
-)
+from forge.observability.perf_tracker import _TimerCPU, _TimerGPU, trace, Tracer
 
 
 @pytest.fixture
@@ -43,11 +38,11 @@ def mock_cuda_memory():
     """Mock CUDA memory with 1GB start, 2GB end, 3GB peak."""
     gb_bytes = 1024**3
     with patch.multiple(
-        "torch.cuda",
+        "torch.accelerator",
         is_available=Mock(return_value=True),
         memory_allocated=Mock(side_effect=[gb_bytes, 2 * gb_bytes]),
         max_memory_allocated=Mock(return_value=3 * gb_bytes),
-        reset_peak_memory_stats=Mock(),
+        reset_max_memory_allocated=Mock(),
     ):
         yield
 
@@ -124,8 +119,8 @@ class TestTracingModes:
     """Test all tracing modes with comprehensive workflows."""
 
     def setup_method(self, method):
-        """GPU warmup to avoid ~0.4s first-call delay in tests."""
-        if _get_device() is not None:
+        """CUDA warmup to avoid ~0.4s first-call delay in tests."""
+        if torch.accelerator.is_available():
             with patch("forge.observability.perf_tracker.record_metric"):
                 warmup_tracer = Tracer("cuda_warmup", timer="gpu")
                 warmup_tracer.start()
@@ -138,8 +133,8 @@ class TestTracingModes:
         self, mode, timer, mock_record_metric_calls, monkeypatch
     ):
         """Test comprehensive workflow: timing + concurrency across all modes."""
-        if timer == "gpu" and _get_device() is None:
-            pytest.skip("GPU not available")
+        if timer == "gpu" and not torch.accelerator.is_available():
+            pytest.skip("CUDA not available")
 
         monkeypatch.setenv(METRIC_TIMER_USES_GPU.name, str(timer == "gpu"))
 
@@ -165,8 +160,8 @@ class TestTracingModes:
         if mode == "direct":
             tracer = Tracer("backend_test", timer=timer)
             tracer.start()
-            if timer == "gpu" and _get_device() is not None:
-                assert isinstance(tracer._timer, _TimerGPU), "Expected GPU timer"
+            if timer == "gpu" and torch.accelerator.is_available():
+                assert isinstance(tracer._timer, _TimerGPU), "Expected CUDA timer"
             else:
                 value = METRIC_TIMER_USES_GPU.get_value()
                 assert isinstance(tracer._timer, _TimerCPU), "Expected CPU timer"
@@ -330,9 +325,9 @@ class TestErrorConditionsAndCompatibility:
             len(cpu_durations_list2) == 1 and cpu_durations_list2[0][0] == "cpu_step2"
         )
 
-        # Test GPU timer reuse (if available)
-        if _get_device() is not None:
-            cuda_timer = _TimerGPU(_get_device())
+        # Test CUDA timer reuse (if available)
+        if torch.accelerator.is_available():
+            cuda_timer = _TimerGPU()
             cuda_timer.start()
             cuda_timer.step("cuda_step1")
             cuda_durations_list1, cuda_final_ms1 = cuda_timer.get_all_durations()
@@ -391,11 +386,11 @@ class TestEnvironmentConfiguration:
         self, env_value, expected_backend, monkeypatch
     ):
         """Test METRIC_TIMER_USES_GPU env var overrides timer parameter."""
-        if env_value == "true" and _get_device() is None:
-            pytest.skip("GPU not available")
+        if env_value == "true" and not torch.accelerator.is_available():
+            pytest.skip("CUDA not available")
 
         with (
-            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.accelerator.is_available", return_value=True),
             patch("forge.observability.perf_tracker.record_metric"),
         ):
             monkeypatch.setenv(METRIC_TIMER_USES_GPU.name, env_value)
