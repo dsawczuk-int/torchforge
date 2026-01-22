@@ -15,7 +15,7 @@ from forge.env import DISABLE_PERF_METRICS, METRIC_TIMER_USES_GPU
 from forge.observability.metrics import Reduce
 
 from forge.observability.perf_tracker import (
-    _get_gpu_backend,
+    _get_device,
     _TimerCPU,
     _TimerGPU,
     trace,
@@ -125,7 +125,7 @@ class TestTracingModes:
 
     def setup_method(self, method):
         """GPU warmup to avoid ~0.4s first-call delay in tests."""
-        if _get_gpu_backend() is not None:
+        if _get_device() is not None:
             with patch("forge.observability.perf_tracker.record_metric"):
                 warmup_tracer = Tracer("cuda_warmup", timer="gpu")
                 warmup_tracer.start()
@@ -138,7 +138,7 @@ class TestTracingModes:
         self, mode, timer, mock_record_metric_calls, monkeypatch
     ):
         """Test comprehensive workflow: timing + concurrency across all modes."""
-        if timer == "gpu" and _get_gpu_backend() is None:
+        if timer == "gpu" and _get_device() is None:
             pytest.skip("GPU not available")
 
         monkeypatch.setenv(METRIC_TIMER_USES_GPU.name, str(timer == "gpu"))
@@ -165,7 +165,7 @@ class TestTracingModes:
         if mode == "direct":
             tracer = Tracer("backend_test", timer=timer)
             tracer.start()
-            if timer == "gpu" and _get_gpu_backend() is not None:
+            if timer == "gpu" and _get_device() is not None:
                 assert isinstance(tracer._timer, _TimerGPU), "Expected GPU timer"
             else:
                 value = METRIC_TIMER_USES_GPU.get_value()
@@ -331,8 +331,8 @@ class TestErrorConditionsAndCompatibility:
         )
 
         # Test GPU timer reuse (if available)
-        if _get_gpu_backend() is not None:
-            cuda_timer = _TimerGPU(_get_gpu_backend())
+        if _get_device() is not None:
+            cuda_timer = _TimerGPU(_get_device())
             cuda_timer.start()
             cuda_timer.step("cuda_step1")
             cuda_durations_list1, cuda_final_ms1 = cuda_timer.get_all_durations()
@@ -391,7 +391,7 @@ class TestEnvironmentConfiguration:
         self, env_value, expected_backend, monkeypatch
     ):
         """Test METRIC_TIMER_USES_GPU env var overrides timer parameter."""
-        if env_value == "true" and _get_gpu_backend() is None:
+        if env_value == "true" and _get_device() is None:
             pytest.skip("GPU not available")
 
         with (

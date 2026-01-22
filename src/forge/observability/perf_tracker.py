@@ -82,36 +82,47 @@ class _GPUEvent(_Event):
     def elapsed_time(self, end_event: _Event) -> float:
         if isinstance(end_event, _GPUEvent):
             return float(self._event.elapsed_time(end_event._event))
-        return float(self._event.elapsed_time(end_event))  # type: ignore[arg-type]
+        return float(self._event.elapsed_time(end_event))
 
 
-class _TorchGPUBackend(_DeviceProtocol):
-    """Wrapper exposing a uniform interface for torch.cuda/torch.xpu."""
-
-    def __init__(self, module: Any) -> None:
-        self._module = module
-
+class _DeviceCUDA(_DeviceProtocol):
     def record_event(self) -> _GPUEvent:
-        event = _GPUEvent(self._module.Event(enable_timing=True))
-        event.record(self._module.current_stream())
+        event = _GPUEvent(torch.cuda.Event(enable_timing=True))
+        event.record(torch.cuda.current_stream())
         return event
 
     def reset_peak_memory_stats(self) -> None:
-        self._module.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats()
 
     def memory_allocated(self) -> int:
-        return int(self._module.memory_allocated())
+        return int(torch.cuda.memory_allocated())
 
     def max_memory_allocated(self) -> int:
-        return int(self._module.max_memory_allocated())
+        return int(torch.cuda.max_memory_allocated())
 
 
-def _get_device_backend() -> _DeviceProtocol | None:
-    """Return a GPU backend wrapper for CUDA/XPU if available, else None."""
+class _DeviceXPU(_DeviceProtocol):
+    def record_event(self) -> _GPUEvent:
+        event = _GPUEvent(torch.xpu.Event(enable_timing=True))
+        event.record(torch.xpu.current_stream())
+        return event
+
+    def reset_peak_memory_stats(self) -> None:
+        torch.xpu.reset_peak_memory_stats()
+
+    def memory_allocated(self) -> int:
+        return int(torch.xpu.memory_allocated())
+
+    def max_memory_allocated(self) -> int:
+        return int(torch.xpu.max_memory_allocated())
+
+
+def _get_device() -> _DeviceProtocol | None:
+    """Return a GPU device for CUDA/XPU if available, else None."""
     if torch.cuda.is_available():
-        return _TorchGPUBackend(torch.cuda)
+        return _DeviceCUDA()
     if torch.xpu.is_available():
-        return _TorchGPUBackend(torch.xpu)
+        return _DeviceXPU()
     return None
 
 
@@ -184,7 +195,7 @@ class Tracer:
         )
         self._active = False
 
-        self._device_backend: _DeviceProtocol | None = _get_device_backend()
+        self._device_backend: _DeviceProtocol | None = _get_device()
 
         # Timing state
         self._timer: _TimerProtocol | None = None
