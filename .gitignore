@@ -83,6 +83,7 @@ ipython_config.py
 *.ckpt
 *.distcp
 .metadata
+checkpoint
 
 # mypy
 .mypy_cache/

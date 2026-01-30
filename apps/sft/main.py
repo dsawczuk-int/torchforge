@@ -21,12 +21,13 @@ from typing import Any
 import torch
 
 import torchtitan.experiments.forge.train_spec as forge_train_spec
-from forge.controller import ForgeActor
+from forge.controller import ForgeActor, shutdown
 from forge.data.collate import collate_padded
 from forge.data.datasets.sft_dataset import AlpacaToMessages, sft_iterable_dataset
 from forge.data.tokenizer import HuggingFaceModelTokenizer
 from forge.data.utils import StopAfterOneEpoch
 from forge.observability import get_or_create_metric_logger, record_metric, Reduce
+from forge.observability.perf_tracker import Tracer
 from forge.util.config import parse
 
 from monarch.actor import current_rank, current_size, endpoint
@@ -417,6 +418,9 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
 
     @endpoint
     async def train(self) -> None:
+        tracer = Tracer("sft_perf/evaluate", track_memory=True, timer="gpu")
+        tracer.start()
+
         dataloader = iter(self.train_dataloader)
         self.optimizers.zero_grad()
 
@@ -433,7 +437,7 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
             # Move tensors to the appropriate device
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to("cuda")  # TODO: hardcoded for now
+                    batch[k] = v.to(self.device)
 
             self.train_step(batch)
             # self.profiler.step()
@@ -460,6 +464,8 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
         if self.validation_enabled:
             logger.info("Running final evaluation at end of training...")
             await self.evaluate()
+
+        tracer.stop()
 
     @endpoint
     async def cleanup(self) -> None:
@@ -489,10 +495,11 @@ async def run(cfg: DictConfig) -> None:
     logging.info("Recipe has been setup. Training now.")
     await recipe.train.call()
 
+    mlogger.flush.call_one(global_step=12345)
     logging.info("Done training. Clean up")
     await recipe.cleanup.call()
 
-    await recipe.mesh.stop()
+    await shutdown()
     logging.info("All done!")
 
 
