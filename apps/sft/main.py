@@ -27,6 +27,7 @@ from forge.data.datasets.sft_dataset import AlpacaToMessages, sft_iterable_datas
 from forge.data.tokenizer import HuggingFaceModelTokenizer
 from forge.data.utils import StopAfterOneEpoch
 from forge.observability import get_or_create_metric_logger, record_metric, Reduce
+from forge.observability.perf_tracker import Tracer
 from forge.util.config import parse
 
 from monarch.actor import current_rank, current_size, endpoint
@@ -417,6 +418,9 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
 
     @endpoint
     async def train(self) -> None:
+        tracer = Tracer("sft_perf/evaluate", track_memory=True, timer="gpu")
+        tracer.start()
+
         dataloader = iter(self.train_dataloader)
         self.optimizers.zero_grad()
 
@@ -461,6 +465,8 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
             logger.info("Running final evaluation at end of training...")
             await self.evaluate()
 
+        tracer.stop()
+
     @endpoint
     async def cleanup(self) -> None:
         if self.checkpointer:
@@ -489,6 +495,7 @@ async def run(cfg: DictConfig) -> None:
     logging.info("Recipe has been setup. Training now.")
     await recipe.train.call()
 
+    mlogger.flush.call_one(global_step=12345)
     logging.info("Done training. Clean up")
     await recipe.cleanup.call()
 
